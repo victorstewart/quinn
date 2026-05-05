@@ -1,0 +1,22 @@
+[package]
+name = "quinn-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quinn-rs/quinn"
+
+[lib]
+name = "quinn_ffi"
+crate-type = ["staticlib"]
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+io-uring = "0.7.12"
+libc = "0.2"
+quinn = { path = "../quinn", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { workspace = true, features = ["ring"] }
+rustls-pemfile = "2"
+socket2.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "time", "io-util"] }
