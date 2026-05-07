@@ -23,12 +23,21 @@ typedef struct quinn_ffi_endpoint_config_t {
     uint16_t port;
     const char *cert_path;
     const char *key_path;
+    const char *chain_path;
     uint32_t backend;
+    bool tls_verify_peer;
+    bool aggressive_congestion;
+    uint32_t initial_cwnd_packets;
+    uint32_t ack_frequency_packets;
 } quinn_ffi_endpoint_config_t;
 
 quinn_ffi_endpoint_t *quinn_ffi_endpoint_new(const quinn_ffi_endpoint_config_t *config);
 
 void quinn_ffi_endpoint_free(quinn_ffi_endpoint_t *endpoint);
+
+uintptr_t quinn_ffi_endpoint_send_buffer_size(const quinn_ffi_endpoint_t *endpoint);
+
+uintptr_t quinn_ffi_endpoint_recv_buffer_size(const quinn_ffi_endpoint_t *endpoint);
 
 int quinn_ffi_client_connect(
     quinn_ffi_endpoint_t *endpoint,

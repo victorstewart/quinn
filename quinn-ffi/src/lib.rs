@@ -16,11 +16,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use io_uring::{IoUring, opcode, types};
+use io_uring::{IoUring, cqueue, opcode, types};
 use libc::{iovec, msghdr, sockaddr_in6, sockaddr_storage, socklen_t};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::{
-    ClientConfig, DigitallySignedStruct, ServerConfig, SignatureScheme,
+    ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
 };
@@ -36,12 +36,18 @@ const ALPN: &[u8] = b"perf";
 const BACKEND_SYSCALL: u32 = 0;
 const BACKEND_IOURING: u32 = 1;
 const IORING_ENTRIES: u32 = 256;
-const IORING_RECV_SLOTS: usize = 64;
-const IORING_RECV_TAG: u64 = 2;
 const IORING_SEND_TAG: u64 = 3;
 const IORING_CANCEL_TAG: u64 = 4;
+const IORING_PROVIDE_BUFFERS_TAG: u64 = 5;
+const IORING_RECV_MULTI_TAG: u64 = 6;
 const IORING_TAG_MASK: u64 = 0b111;
 const IORING_RECVSEND_POLL_FIRST: u16 = 1;
+const IORING_RECV_BUFFER_GROUP: u16 = 7;
+const IORING_RECV_BUFFER_COUNT: u16 = 1024;
+const IORING_RECV_BUFFER_SIZE: usize =
+    128 + std::mem::size_of::<sockaddr_storage>() + UDP_PAYLOAD_SIZE as usize;
+const AGGRESSIVE_INITIAL_CWND_PACKETS: u32 = 32;
+const AGGRESSIVE_ACK_FREQUENCY_PACKETS: u32 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NetworkBackend {
@@ -72,17 +78,44 @@ struct IouringState {
     active_sends: HashSet<u64>,
     error: Option<String>,
     shutdown: bool,
+    recv_multi_msg: msghdr,
+    recv_multi_buffers: Vec<u8>,
+}
+
+// The raw pointers inside `recv_multi_msg` are never dereferenced by Rust and
+// the state is only accessed while held behind the mutex Quinn stores it in.
+unsafe impl Send for IouringState {}
+
+#[derive(Clone, Copy)]
+struct BenchmarkProfiles {
+    tls_verify_peer: bool,
+    aggressive_congestion: bool,
+    initial_cwnd_packets: u32,
+    ack_frequency_packets: u32,
+}
+
+struct BoundUdpSocket {
+    socket: std::net::UdpSocket,
+    send_buffer_size: usize,
+    recv_buffer_size: usize,
 }
 
 impl IouringState {
-    fn new(ring: IoUring, active_recvs: HashSet<u64>) -> Self {
+    fn new(ring: IoUring) -> Self {
+        let mut recv_multi_msg: msghdr = unsafe { std::mem::zeroed() };
+        recv_multi_msg.msg_namelen = std::mem::size_of::<sockaddr_storage>() as socklen_t;
         Self {
             ring,
             recv_queue: Mutex::new(VecDeque::new()),
-            active_recvs,
+            active_recvs: HashSet::new(),
             active_sends: HashSet::new(),
             error: None,
             shutdown: false,
+            recv_multi_msg,
+            recv_multi_buffers: vec![
+                0;
+                IORING_RECV_BUFFER_SIZE * usize::from(IORING_RECV_BUFFER_COUNT)
+            ],
         }
     }
 
@@ -96,7 +129,34 @@ impl IouringState {
         self.error = Some(error.into());
     }
 
-    fn drain_completions(&mut self, fd: RawFd) -> io::Result<()> {
+    fn provide_recv_buffers(&mut self, bid: u16, count: u16) -> io::Result<()> {
+        let offset = usize::from(bid) * IORING_RECV_BUFFER_SIZE;
+        let Some(end) = offset.checked_add(usize::from(count) * IORING_RECV_BUFFER_SIZE) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "io_uring provided buffer range overflow",
+            ));
+        };
+        if end > self.recv_multi_buffers.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "io_uring provided buffer range exceeds pool",
+            ));
+        }
+
+        let entry = opcode::ProvideBuffers::new(
+            unsafe { self.recv_multi_buffers.as_mut_ptr().add(offset) },
+            IORING_RECV_BUFFER_SIZE as i32,
+            count,
+            IORING_RECV_BUFFER_GROUP,
+            bid,
+        )
+        .build()
+        .user_data(IORING_PROVIDE_BUFFERS_TAG);
+        push_entry(&mut self.ring, entry)
+    }
+
+    fn drain_setup_completions(&mut self) -> io::Result<()> {
         let completions: Vec<_> = self
             .ring
             .completion()
@@ -104,35 +164,112 @@ impl IouringState {
             .collect();
 
         for (user_data, result) in completions {
+            if user_data != IORING_PROVIDE_BUFFERS_TAG {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected io_uring setup completion",
+                ));
+            }
+            if result < 0 {
+                return Err(io::Error::from_raw_os_error(-result));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn arm_recv_multishot(&mut self, fd: RawFd) -> io::Result<()> {
+        let entry = opcode::RecvMsgMulti::new(
+            types::Fd(fd),
+            &self.recv_multi_msg,
+            IORING_RECV_BUFFER_GROUP,
+        )
+        .ioprio(IORING_RECVSEND_POLL_FIRST)
+        .build()
+        .user_data(IORING_RECV_MULTI_TAG);
+        push_entry(&mut self.ring, entry)?;
+        self.active_recvs.insert(IORING_RECV_MULTI_TAG);
+        Ok(())
+    }
+
+    fn handle_recv_multishot(&mut self, fd: RawFd, result: i32, flags: u32) -> io::Result<()> {
+        if !cqueue::more(flags) {
+            self.active_recvs.remove(&IORING_RECV_MULTI_TAG);
+        }
+
+        if result < 0 {
+            let error = io::Error::from_raw_os_error(-result);
+            if (error.kind() == io::ErrorKind::WouldBlock
+                || error.kind() == io::ErrorKind::ConnectionReset)
+                && !self.shutdown
+            {
+            } else if error.kind() != io::ErrorKind::ConnectionReset
+                && !expected_shutdown_completion(&error, self.shutdown)
+            {
+                return Err(error);
+            }
+        } else if result > 0 {
+            let Some(bid) = cqueue::buffer_select(flags) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "io_uring multishot recv completed without selected buffer",
+                ));
+            };
+            let offset = usize::from(bid) * IORING_RECV_BUFFER_SIZE;
+            let available = usize::min(result as usize, IORING_RECV_BUFFER_SIZE);
+            let buffer = &self.recv_multi_buffers[offset..offset + available];
+            let parsed = types::RecvMsgOut::parse(buffer, &self.recv_multi_msg).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid io_uring recvmsg output",
+                )
+            })?;
+            if parsed.is_name_data_truncated()
+                || parsed.is_control_data_truncated()
+                || parsed.is_payload_truncated()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated io_uring multishot datagram",
+                ));
+            }
+            let mut storage: sockaddr_storage = unsafe { std::mem::zeroed() };
+            let name = parsed.name_data();
+            let copy_len = usize::min(name.len(), std::mem::size_of::<sockaddr_storage>());
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    name.as_ptr(),
+                    (&mut storage as *mut sockaddr_storage).cast(),
+                    copy_len,
+                );
+            }
+            let addr = addr_from_sockaddr(&storage)?;
+            self.recv_queue.lock().unwrap().push_back(ReceivedDatagram {
+                addr,
+                bytes: parsed.payload_data().to_vec(),
+            });
+            self.provide_recv_buffers(bid, 1)?;
+        }
+
+        if !self.shutdown && !self.active_recvs.contains(&IORING_RECV_MULTI_TAG) {
+            self.arm_recv_multishot(fd)?;
+        }
+
+        Ok(())
+    }
+
+    fn drain_completions(&mut self, fd: RawFd) -> io::Result<()> {
+        let completions: Vec<_> = self
+            .ring
+            .completion()
+            .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags()))
+            .collect();
+
+        for (user_data, result, flags) in completions {
             let (tag, ptr) = split_tagged_ptr(user_data);
             match tag {
-                IORING_RECV_TAG => {
-                    self.active_recvs.remove(&user_data);
-                    let op = unsafe { Box::from_raw(ptr.cast::<RecvOp>()) };
-                    if result > 0 {
-                        let len = result as usize;
-                        let addr = addr_from_sockaddr(&op.addr)?;
-                        self.recv_queue.lock().unwrap().push_back(ReceivedDatagram {
-                            addr,
-                            bytes: op.buffer[..len].to_vec(),
-                        });
-                    } else if result < 0 {
-                        let error = io::Error::from_raw_os_error(-result);
-                        if (error.kind() == io::ErrorKind::WouldBlock
-                            || error.kind() == io::ErrorKind::ConnectionReset)
-                            && !self.shutdown
-                        {
-                        } else if error.kind() != io::ErrorKind::ConnectionReset
-                            && !expected_shutdown_completion(&error, self.shutdown)
-                        {
-                            return Err(error);
-                        }
-                    }
-
-                    if !self.shutdown {
-                        self.active_recvs
-                            .insert(submit_recv(&mut self.ring, fd, op)?);
-                    }
+                IORING_RECV_MULTI_TAG => {
+                    self.handle_recv_multishot(fd, result, flags)?;
                 }
                 IORING_SEND_TAG => {
                     self.active_sends.remove(&user_data);
@@ -145,6 +282,11 @@ impl IouringState {
                         } else if !expected_shutdown_completion(&error, self.shutdown) {
                             return Err(error);
                         }
+                    }
+                }
+                IORING_PROVIDE_BUFFERS_TAG => {
+                    if result < 0 {
+                        return Err(io::Error::from_raw_os_error(-result));
                     }
                 }
                 IORING_CANCEL_TAG => {}
@@ -223,12 +365,19 @@ pub struct QuinnFfiEndpointConfig {
     port: u16,
     cert_path: *const c_char,
     key_path: *const c_char,
+    chain_path: *const c_char,
     backend: u32,
+    tls_verify_peer: bool,
+    aggressive_congestion: bool,
+    initial_cwnd_packets: u32,
+    ack_frequency_packets: u32,
 }
 
 pub struct QuinnFfiEndpoint {
     runtime: Arc<tokio::runtime::Runtime>,
     endpoint: quinn::Endpoint,
+    send_buffer_size: usize,
+    recv_buffer_size: usize,
 }
 
 pub struct QuinnFfiConnection {
@@ -243,7 +392,7 @@ pub struct QuinnFfiBidiStream {
 }
 
 fn store_global_error(error: anyhow::Error) {
-    let message = error.to_string().replace('\0', " ");
+    let message = format!("{error:#}").replace('\0', " ");
     LAST_ERROR.with(|last_error| {
         *last_error.borrow_mut() =
             Some(CString::new(message).unwrap_or_else(|_| CString::new("quinn error").unwrap()));
@@ -251,7 +400,7 @@ fn store_global_error(error: anyhow::Error) {
 }
 
 fn set_error(error: anyhow::Error) -> i32 {
-    let message = error.to_string().replace('\0', " ");
+    let message = format!("{error:#}").replace('\0', " ");
     let c_string = CString::new(message).unwrap_or_else(|_| CString::new("quinn error").unwrap());
     LAST_ERROR.with(|last_error| {
         *last_error.borrow_mut() = Some(c_string);
@@ -302,7 +451,7 @@ fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
         .context("no private key found")
 }
 
-fn transport_config() -> quinn::TransportConfig {
+fn transport_config(profiles: BenchmarkProfiles) -> quinn::TransportConfig {
     let (connection_window, stream_window) = window_sizes();
     let mut config = quinn::TransportConfig::default();
     config.max_idle_timeout(Some(Duration::from_millis(30_000).try_into().unwrap()));
@@ -314,7 +463,24 @@ fn transport_config() -> quinn::TransportConfig {
     config.initial_mtu(UDP_PAYLOAD_SIZE);
     config.mtu_discovery_config(None);
     config.enable_segmentation_offload(false);
-    config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    let mut bbr_config = quinn::congestion::BbrConfig::default();
+    if profiles.aggressive_congestion {
+        let initial_cwnd_packets = profiles
+            .initial_cwnd_packets
+            .max(AGGRESSIVE_INITIAL_CWND_PACKETS);
+        bbr_config.initial_window(u64::from(initial_cwnd_packets) * u64::from(UDP_PAYLOAD_SIZE));
+
+        if profiles.ack_frequency_packets > 0 {
+            let ack_frequency_packets = profiles
+                .ack_frequency_packets
+                .max(AGGRESSIVE_ACK_FREQUENCY_PACKETS);
+            let mut ack_frequency = quinn::AckFrequencyConfig::default();
+            ack_frequency.ack_eliciting_threshold(quinn::VarInt::from_u32(ack_frequency_packets));
+            ack_frequency.max_ack_delay(Some(Duration::from_millis(25)));
+            config.ack_frequency_config(Some(ack_frequency));
+        }
+    }
+    config.congestion_controller_factory(Arc::new(bbr_config));
     config
 }
 
@@ -326,15 +492,24 @@ fn window_sizes() -> (u32, u32) {
     }
 }
 
-fn udp_socket(addr: SocketAddr, nonblocking: bool) -> Result<std::net::UdpSocket> {
+fn udp_socket(addr: SocketAddr, nonblocking: bool) -> Result<BoundUdpSocket> {
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
     if addr.is_ipv6() {
         socket.set_only_v6(true)?;
     }
     socket.set_reuse_address(true)?;
+    let (connection_window, _) = window_sizes();
+    socket.set_send_buffer_size(connection_window as usize)?;
+    socket.set_recv_buffer_size(connection_window as usize)?;
+    let send_buffer_size = socket.send_buffer_size()?;
+    let recv_buffer_size = socket.recv_buffer_size()?;
     socket.set_nonblocking(nonblocking)?;
     socket.bind(&addr.into())?;
-    Ok(socket.into())
+    Ok(BoundUdpSocket {
+        socket: socket.into(),
+        send_buffer_size,
+        recv_buffer_size,
+    })
 }
 
 fn sockaddr_from_addr(addr: SocketAddr) -> io::Result<(sockaddr_storage, socklen_t)> {
@@ -390,42 +565,6 @@ fn split_tagged_ptr(user_data: u64) -> (u64, *mut ()) {
     )
 }
 
-struct RecvOp {
-    buffer: Vec<u8>,
-    iov: iovec,
-    addr: sockaddr_storage,
-    hdr: msghdr,
-}
-
-impl RecvOp {
-    fn boxed() -> Box<Self> {
-        let mut op = Box::new(Self {
-            buffer: vec![0; UDP_PAYLOAD_SIZE as usize],
-            iov: iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            },
-            addr: unsafe { std::mem::zeroed() },
-            hdr: unsafe { std::mem::zeroed() },
-        });
-        op.refresh();
-        op
-    }
-
-    fn refresh(&mut self) {
-        self.addr = unsafe { std::mem::zeroed() };
-        self.iov = iovec {
-            iov_base: self.buffer.as_mut_ptr().cast(),
-            iov_len: self.buffer.len(),
-        };
-        self.hdr = unsafe { std::mem::zeroed() };
-        self.hdr.msg_name = (&mut self.addr as *mut sockaddr_storage).cast();
-        self.hdr.msg_namelen = std::mem::size_of::<sockaddr_storage>() as socklen_t;
-        self.hdr.msg_iov = &mut self.iov;
-        self.hdr.msg_iovlen = 1;
-    }
-}
-
 struct SendOp {
     data: Vec<u8>,
     addr: sockaddr_storage,
@@ -475,23 +614,6 @@ fn push_entry(ring: &mut IoUring, entry: io_uring::squeue::Entry) -> io::Result<
         }
         ring.submit()?;
     }
-}
-
-fn submit_recv(ring: &mut IoUring, fd: RawFd, mut op: Box<RecvOp>) -> io::Result<u64> {
-    op.refresh();
-    let ptr = Box::into_raw(op);
-    let user_data = tagged_ptr(ptr, IORING_RECV_TAG);
-    let entry = opcode::RecvMsg::new(types::Fd(fd), unsafe { &mut (*ptr).hdr })
-        .ioprio(IORING_RECVSEND_POLL_FIRST)
-        .build()
-        .user_data(user_data);
-    if let Err(error) = push_entry(ring, entry) {
-        unsafe {
-            drop(Box::from_raw(ptr));
-        }
-        return Err(error);
-    }
-    Ok(user_data)
 }
 
 fn submit_send(ring: &mut IoUring, fd: RawFd, mut op: Box<SendOp>) -> io::Result<u64> {
@@ -551,19 +673,20 @@ impl IouringUdpSocket {
         socket.set_nonblocking(true)?;
         let local_addr = socket.local_addr()?;
         let fd = socket.as_raw_fd();
-        let mut ring = IoUring::new(IORING_ENTRIES)?;
+        let ring = IoUring::new(IORING_ENTRIES)?;
         let ring_fd = ring.as_raw_fd();
-        let mut active_recvs = HashSet::new();
-        for _ in 0..IORING_RECV_SLOTS {
-            active_recvs.insert(submit_recv(&mut ring, fd, RecvOp::boxed())?);
-        }
-        ring.submit()?;
+        let mut state = IouringState::new(ring);
+        state.provide_recv_buffers(0, IORING_RECV_BUFFER_COUNT)?;
+        state.ring.submit_and_wait(1)?;
+        state.drain_setup_completions()?;
+        state.arm_recv_multishot(fd)?;
+        state.ring.submit()?;
 
         Ok(Self {
             local_addr,
             socket,
             poll_fd: AsyncFd::new(IouringPollFd(ring_fd))?,
-            state: Arc::new(Mutex::new(IouringState::new(ring, active_recvs))),
+            state: Arc::new(Mutex::new(state)),
         })
     }
 }
@@ -586,7 +709,7 @@ impl Drop for IouringUdpSocket {
         }
         let _ = state.ring.submit();
 
-        for _ in 0..(IORING_RECV_SLOTS + 32) {
+        for _ in 0..32 {
             if state.active_recvs.is_empty() && state.active_sends.is_empty() {
                 break;
             }
@@ -738,7 +861,11 @@ impl quinn::UdpSender for IouringUdpSender {
     }
 }
 
-fn make_server_config(cert_path: &str, key_path: &str) -> Result<quinn::ServerConfig> {
+fn make_server_config(
+    cert_path: &str,
+    key_path: &str,
+    profiles: BenchmarkProfiles,
+) -> Result<quinn::ServerConfig> {
     let provider = rustls::crypto::ring::default_provider();
     let mut crypto = ServerConfig::builder_with_provider(provider.into())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -748,21 +875,35 @@ fn make_server_config(cert_path: &str, key_path: &str) -> Result<quinn::ServerCo
 
     let mut config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
-    config.transport = Arc::new(transport_config());
+    config.transport = Arc::new(transport_config(profiles));
     Ok(config)
 }
 
-fn make_client_config() -> Result<quinn::ClientConfig> {
+fn make_client_config(
+    chain_path: &str,
+    profiles: BenchmarkProfiles,
+) -> Result<quinn::ClientConfig> {
     let provider = rustls::crypto::ring::default_provider();
-    let mut crypto = ClientConfig::builder_with_provider(provider.into())
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_no_client_auth();
+    let mut crypto = if profiles.tls_verify_peer {
+        let mut roots = RootCertStore::empty();
+        for cert in load_certs(chain_path)? {
+            roots.add(cert)?;
+        }
+        ClientConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    } else {
+        ClientConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth()
+    };
     crypto.alpn_protocols = vec![ALPN.to_vec()];
 
     let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
-    config.transport_config(Arc::new(transport_config()));
+    config.transport_config(Arc::new(transport_config(profiles)));
     Ok(config)
 }
 
@@ -799,11 +940,20 @@ pub unsafe extern "C" fn quinn_ffi_endpoint_new(
         let runtime = Arc::new(Builder::new_current_thread().enable_all().build()?);
         let bind_addr = socket_addr(config.address, config.port)?;
         let backend = NetworkBackend::from_ffi(config.backend)?;
+        let profiles = BenchmarkProfiles {
+            tls_verify_peer: config.tls_verify_peer,
+            aggressive_congestion: config.aggressive_congestion,
+            initial_cwnd_packets: config.initial_cwnd_packets,
+            ack_frequency_packets: config.ack_frequency_packets,
+        };
 
-        let endpoint = {
+        let (endpoint, send_buffer_size, recv_buffer_size) = {
             let _guard = runtime.enter();
             let quinn_runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
-            let socket = udp_socket(bind_addr, true)?;
+            let bound_socket = udp_socket(bind_addr, true)?;
+            let send_buffer_size = bound_socket.send_buffer_size;
+            let recv_buffer_size = bound_socket.recv_buffer_size;
+            let socket = bound_socket.socket;
 
             let make_endpoint = |server_config| -> Result<quinn::Endpoint> {
                 let endpoint_config = quinn::EndpointConfig::default();
@@ -826,15 +976,25 @@ pub unsafe extern "C" fn quinn_ffi_endpoint_new(
             if config.is_server {
                 let cert_path = cstr(config.cert_path)?;
                 let key_path = cstr(config.key_path)?;
-                make_endpoint(Some(make_server_config(&cert_path, &key_path)?))?
+                (
+                    make_endpoint(Some(make_server_config(&cert_path, &key_path, profiles)?))?,
+                    send_buffer_size,
+                    recv_buffer_size,
+                )
             } else {
+                let chain_path = cstr(config.chain_path)?;
                 let endpoint = make_endpoint(None)?;
-                endpoint.set_default_client_config(make_client_config()?);
-                endpoint
+                endpoint.set_default_client_config(make_client_config(&chain_path, profiles)?);
+                (endpoint, send_buffer_size, recv_buffer_size)
             }
         };
 
-        Ok(QuinnFfiEndpoint { runtime, endpoint })
+        Ok(QuinnFfiEndpoint {
+            runtime,
+            endpoint,
+            send_buffer_size,
+            recv_buffer_size,
+        })
     }));
 
     match result {
@@ -855,6 +1015,24 @@ pub unsafe extern "C" fn quinn_ffi_endpoint_free(endpoint: *mut QuinnFfiEndpoint
     if !endpoint.is_null() {
         drop(Box::from_raw(endpoint));
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn quinn_ffi_endpoint_send_buffer_size(
+    endpoint: *const QuinnFfiEndpoint,
+) -> usize {
+    endpoint
+        .as_ref()
+        .map_or(0, |endpoint| endpoint.send_buffer_size)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn quinn_ffi_endpoint_recv_buffer_size(
+    endpoint: *const QuinnFfiEndpoint,
+) -> usize {
+    endpoint
+        .as_ref()
+        .map_or(0, |endpoint| endpoint.recv_buffer_size)
 }
 
 #[no_mangle]
