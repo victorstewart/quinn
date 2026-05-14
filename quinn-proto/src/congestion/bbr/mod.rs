@@ -43,7 +43,8 @@ pub struct Bbr {
     min_cwnd: u64,
     prev_in_flight_count: u64,
     exit_probe_rtt_at: Option<Instant>,
-    probe_rtt_last_started_at: Option<Instant>,
+    min_rtt_timestamp: Option<Instant>,
+    min_rtt_expired: bool,
     min_rtt: Duration,
     exiting_quiescence: bool,
     pacing_rate: u64,
@@ -84,7 +85,8 @@ impl Bbr {
             min_cwnd: calculate_min_window(current_mtu as u64),
             prev_in_flight_count: 0,
             exit_probe_rtt_at: None,
-            probe_rtt_last_started_at: None,
+            min_rtt_timestamp: None,
+            min_rtt_expired: false,
             min_rtt: Default::default(),
             exiting_quiescence: false,
             pacing_rate: 0,
@@ -211,10 +213,11 @@ impl Bbr {
 
     fn is_min_rtt_expired(&self, now: Instant, app_limited: bool) -> bool {
         !app_limited
+            && self.min_rtt.as_nanos() != 0
             && self
-                .probe_rtt_last_started_at
-                .map(|last| now.saturating_duration_since(last) > Duration::from_secs(10))
-                .unwrap_or(true)
+                .min_rtt_timestamp
+                .map(|stamp| now.saturating_duration_since(stamp) > Duration::from_secs(10))
+                .unwrap_or(false)
     }
 
     fn maybe_enter_or_exit_probe_rtt(
@@ -222,16 +225,14 @@ impl Bbr {
         now: Instant,
         is_round_start: bool,
         bytes_in_flight: u64,
-        app_limited: bool,
+        min_rtt_expired: bool,
     ) {
-        let min_rtt_expired = self.is_min_rtt_expired(now, app_limited);
         if min_rtt_expired && !self.exiting_quiescence && self.mode != Mode::ProbeRtt {
             self.mode = Mode::ProbeRtt;
             self.pacing_gain = 1.0;
             // Do not decide on the time to exit ProbeRtt until the
             // |bytes_in_flight| is at the target small value.
             self.exit_probe_rtt_at = None;
-            self.probe_rtt_last_started_at = Some(now);
         }
 
         if self.mode == Mode::ProbeRtt {
@@ -247,6 +248,7 @@ impl Bbr {
                     }
                 }
                 Some(exit_time) if is_round_start && now >= exit_time => {
+                    self.min_rtt_timestamp = Some(now);
                     if !self.is_at_full_bandwidth {
                         self.enter_startup_mode();
                     } else {
@@ -258,6 +260,7 @@ impl Bbr {
         }
 
         self.exiting_quiescence = false;
+        self.min_rtt_expired = false;
     }
 
     fn get_target_cwnd(&self, gain: f32) -> u64 {
@@ -407,8 +410,12 @@ impl Controller for Bbr {
         self.max_bandwidth
             .on_ack(now, sent, bytes, self.round_count, app_limited);
         self.acked_bytes += bytes;
-        if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
-            self.min_rtt = rtt.min();
+        let sample_min_rtt = rtt.min();
+        let min_rtt_expired = self.is_min_rtt_expired(now, app_limited);
+        if min_rtt_expired || self.min_rtt.as_nanos() == 0 || sample_min_rtt < self.min_rtt {
+            self.min_rtt = sample_min_rtt;
+            self.min_rtt_timestamp = Some(now);
+            self.min_rtt_expired |= min_rtt_expired;
         }
     }
 
@@ -453,7 +460,7 @@ impl Controller for Bbr {
 
         self.maybe_exit_startup_or_drain(now, in_flight);
 
-        self.maybe_enter_or_exit_probe_rtt(now, is_round_start, in_flight, app_limited);
+        self.maybe_enter_or_exit_probe_rtt(now, is_round_start, in_flight, self.min_rtt_expired);
 
         // After the model is updated, recalculate the pacing rate and congestion window.
         self.calculate_pacing_rate();
